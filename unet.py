@@ -8,6 +8,46 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from matplotlib import pyplot as plt
+import scipy
+import skimage
+
+def compute_weight (label, w_0 = 10, std = 5):
+    # 统计前景背景元素数量
+    label = label / 255
+    label = label.astype(np.uint8)
+    fg_num = np.count_nonzero(label == 1)  # 前景元素数量
+    bg_num = label.size - fg_num  # 背景元素数量
+
+    # 计算前景和背景的出现频率
+    w_c = np.copy(label)
+    w_c[w_c == 0] = 1 / bg_num
+    w_c[w_c == 1] = 1 / fg_num
+
+    # 得到不同的前景连通
+    label_map = skimage.measure.label(label_image = label, connectivity = 2)
+
+    # 计算像素到不同边缘的距离
+    d_list = []
+    for i in range(label_map.max()):
+        fg_region = (label_map == (i + 1))
+        edge = skimage.segmentation.find_boundaries(fg_region, mode = "inner")  # 得到边缘
+        distance = scipy.ndimage.distance_transform_edt(edge == 0)  # 计算到边缘的距离
+        d_list.append(distance)
+
+    # 得到d1和d2
+    d = np.stack(d_list, axis = 0)
+    if d.shape[0] == 1:  # 如果只有一个边缘，则d1和d2相等
+        d1 = d[0, :, :]
+        d2 = d[0, :, :]
+    else:
+        d = np.sort(d, axis = 0)  # 升序排序
+        d1 = d[0, :, :]
+        d2 = d[1, :, :]
+
+    w = w_c + w_0 * np.exp(-((d1 + d2) ** 2) / (2 * std ** 2))
+    w = w / (np.mean(w) + 1e-12)  # 使用均值归一化，让其均值保持为1，加上1e-12防止出现除以0
+    return w
+
 
 '''
 @brief 训练集的类
@@ -39,6 +79,8 @@ class TrainDataset (Dataset):
         data_train = cv.resize(data_train, (512, 512))
         label_train = cv.resize(label_train, (512, 512))
 
+        weight = compute_weight(label_train, w_0 = 1, std = 200)
+
         # 归一化
         data_train = data_train / 255.0
         label_train = label_train / 255.0
@@ -46,8 +88,9 @@ class TrainDataset (Dataset):
         # 转换为pytorch的张量形式
         data_train_tensor = torch.from_numpy(data_train).float().unsqueeze(0)
         label_train_tensor = torch.from_numpy(label_train).long()
+        weight_tensor = torch.from_numpy(weight).float()
 
-        return data_train_tensor, label_train_tensor
+        return data_train_tensor, label_train_tensor, weight_tensor
 
 '''
 @brief 测试集的类
@@ -194,16 +237,21 @@ class Unet (nn.Module):
 '''
 def train (model, dataloader, optimizer, device):
     model.to(device)
-    loss_func = nn.CrossEntropyLoss()  # 损失函数为交叉熵
+    loss_func = nn.CrossEntropyLoss(reduction = 'none')  # 损失函数为交叉熵
     loss_list = []
 
-    for inputs, targets in dataloader:
+    for inputs, targets, weight in dataloader:
+        # 将数据放到device上
         inputs = inputs.to(device)
         targets = targets.to(device)
+        weight = weight.to(device)
 
+        # 实际训练过程
         optimizer.zero_grad()
         outputs = model(inputs)
         loss = loss_func(outputs, targets)
+        loss = weight * loss
+        loss = loss.mean()
         loss.backward()  # 反向传播
         optimizer.step()
 
@@ -255,7 +303,7 @@ if __name__ == '__main__':
     u_net = Unet()
 
     # Adam优化器
-    optimizer = optim.Adam(params = u_net.parameters(), lr = 0.001)
+    optimizer = optim.Adam(params = u_net.parameters(), lr = 0.0001)
 
     # 学习率规划器
     scheduler = StepLR(optimizer, 10, 0.5)
